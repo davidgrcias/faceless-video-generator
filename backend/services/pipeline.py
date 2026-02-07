@@ -108,7 +108,7 @@ def run_pipeline(job: dict, manager: JobManager) -> None:
                 scenes = split_into_scenes(segments, scene_duration=5.0)
                 _log(manager, job_id, f"   {len(scenes)} scenes created.")
 
-                _log(manager, job_id, "🎨 Generating AI images (Pollinations.ai)…")
+                _log(manager, job_id, "🎨 Generating AI images (Stable Horde)…")
 
                 def on_img_progress(i, total):
                     pct = 50 + int((i / total) * 20)  # 50% → 70%

@@ -2,9 +2,12 @@
 AI image generator — multi-provider with retry & beautiful fallbacks.
 
 Provider priority:
-  1. Pollinations.ai  (AI-generated, free, no key)
-  2. Picsum.photos     (curated stock photos, free, no key)
-  3. FFmpeg gradient   (locally generated, always works)
+  1. Stable Horde   (AI-generated, free, distributed volunteer network)
+  2. Picsum.photos  (curated stock photos, free, no key)
+  3. FFmpeg gradient (locally generated, always works)
+
+Stable Horde generates 512×512 images which are then upscaled to target
+resolution via FFmpeg (scale + pad to maintain aspect ratio).
 """
 
 from __future__ import annotations
@@ -22,15 +25,21 @@ import requests
 logger = logging.getLogger("fcg.image_generator")
 
 # ---------------------------------------------------------------------------
-# Provider URLs
+# Stable Horde settings (free, anonymous key)
 # ---------------------------------------------------------------------------
-POLLINATIONS_URL = (
-    "https://image.pollinations.ai/prompt/{prompt}"
-    "?width={width}&height={height}&nologo=true&seed={seed}"
-)
+STABLEHORDE_API = "https://stablehorde.net/api/v2"
+STABLEHORDE_ANON_KEY = "0000000000"
+# Free tier: max 512×512, max 50 steps
+STABLEHORDE_WIDTH = 512
+STABLEHORDE_HEIGHT = 512
+STABLEHORDE_STEPS = 25
+STABLEHORDE_POLL_INTERVAL = 5   # seconds between status polls
+STABLEHORDE_MAX_WAIT = 180      # max seconds to wait for one image
+
+# Picsum (fallback)
 PICSUM_URL = "https://picsum.photos/{width}/{height}"
 
-# Style suffix for Pollinations prompts
+# Style suffix for prompts
 STYLE_SUFFIX = (
     ", cinematic lighting, digital art, vibrant colors, "
     "4k, detailed background, no text, no watermark"
@@ -39,7 +48,7 @@ STYLE_SUFFIX = (
 # Retry settings
 MAX_RETRIES = 3
 RETRY_BACKOFF = [3, 8, 15]  # seconds between retries
-REQUEST_TIMEOUT = 120  # generous timeout for AI generation
+REQUEST_TIMEOUT = 120
 
 # Gradient palette for fallback images (vibrant, not dark)
 GRADIENT_COLORS = [
@@ -64,9 +73,7 @@ def _get_session() -> requests.Session:
     if _session is None:
         _session = requests.Session()
         _session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "FCG-VideoGenerator/1.0",
         })
     return _session
 
@@ -87,7 +94,8 @@ def generate_scene_images(
     """
     Generate one image per scene using a multi-provider pipeline.
 
-    Tries Pollinations.ai first (with retries), then Picsum, then FFmpeg gradient.
+    Tries Stable Horde first (real AI, 512×512 upscaled to target),
+    then Picsum (stock photo), then FFmpeg gradient.
 
     Returns list of {"path", "start", "end", "duration"}.
     """
@@ -99,20 +107,21 @@ def generate_scene_images(
         image_path = str(Path(output_dir) / f"{job_id}_scene_{i:03d}.jpg")
         source = "none"
 
-        # --- Provider 1: Pollinations.ai (AI-generated) ---
+        # --- Provider 1: Stable Horde (AI-generated) ---
         try:
             prompt = _text_to_visual_prompt(text)
             logger.info(
-                "Scene %d/%d — trying Pollinations.ai: '%.60s…'",
+                "Scene %d/%d — trying Stable Horde: '%.60s…'",
                 i + 1, len(scenes), prompt,
             )
-            _download_with_retry(
-                _build_pollinations_url(prompt, width, height, seed=i + 42),
-                image_path,
-            )
-            source = "pollinations"
+            raw_path = str(Path(output_dir) / f"{job_id}_scene_{i:03d}_raw.webp")
+            _generate_stablehorde_image(prompt, raw_path)
+            # Upscale 512×512 → target resolution
+            _upscale_image(raw_path, image_path, width, height)
+            _safe_delete_file(raw_path)
+            source = "stablehorde"
         except Exception as e:
-            logger.warning("Scene %d Pollinations failed: %s", i + 1, e)
+            logger.warning("Scene %d Stable Horde failed: %s", i + 1, e)
 
         # --- Provider 2: Picsum.photos (stock photo) ---
         if source == "none":
@@ -142,9 +151,9 @@ def generate_scene_images(
         if on_progress:
             on_progress(i + 1, len(scenes))
 
-        # Small delay between API calls
-        if source in ("pollinations", "picsum") and i < len(scenes) - 1:
-            time.sleep(1.5)
+        # Small delay between Stable Horde requests to be polite
+        if source == "stablehorde" and i < len(scenes) - 1:
+            time.sleep(2)
 
     return results
 
@@ -208,11 +217,130 @@ def _text_to_visual_prompt(text: str) -> str:
     return clean + STYLE_SUFFIX
 
 
-def _build_pollinations_url(prompt: str, width: int, height: int, seed: int) -> str:
-    encoded = urllib.parse.quote(prompt, safe="")
-    return POLLINATIONS_URL.format(
-        prompt=encoded, width=width, height=height, seed=seed,
+def _generate_stablehorde_image(prompt: str, output_path: str) -> None:
+    """
+    Generate an AI image via the Stable Horde distributed network.
+
+    Submits an async job, polls for completion, downloads the result.
+    Free tier: 512×512, anonymous API key.
+    """
+    session = _get_session()
+
+    # Submit generation request
+    payload = {
+        "prompt": prompt,
+        "params": {
+            "width": STABLEHORDE_WIDTH,
+            "height": STABLEHORDE_HEIGHT,
+            "steps": STABLEHORDE_STEPS,
+            "sampler_name": "k_euler",
+            "cfg_scale": 7,
+        },
+        "nsfw": False,
+        "censor_nsfw": True,
+    }
+
+    resp = session.post(
+        f"{STABLEHORDE_API}/generate/async",
+        json=payload,
+        headers={"apikey": STABLEHORDE_ANON_KEY, "Content-Type": "application/json"},
+        timeout=30,
     )
+
+    if resp.status_code != 202:
+        raise RuntimeError(
+            f"Stable Horde submit failed ({resp.status_code}): {resp.text[:200]}"
+        )
+
+    gen_id = resp.json()["id"]
+    logger.info("Stable Horde job submitted: %s", gen_id)
+
+    # Poll for completion
+    start_time = time.time()
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > STABLEHORDE_MAX_WAIT:
+            raise RuntimeError(
+                f"Stable Horde timed out after {STABLEHORDE_MAX_WAIT}s"
+            )
+
+        time.sleep(STABLEHORDE_POLL_INTERVAL)
+
+        check_resp = session.get(
+            f"{STABLEHORDE_API}/generate/check/{gen_id}", timeout=15,
+        )
+        check_data = check_resp.json()
+        done = check_data.get("done", False)
+        wait_time = check_data.get("wait_time", "?")
+        queue_pos = check_data.get("queue_position", "?")
+
+        logger.debug(
+            "Stable Horde poll: done=%s wait=%ss queue=%s",
+            done, wait_time, queue_pos,
+        )
+
+        if done:
+            break
+
+    # Fetch the generated image
+    status_resp = session.get(
+        f"{STABLEHORDE_API}/generate/status/{gen_id}", timeout=30,
+    )
+    status_data = status_resp.json()
+    generations = status_data.get("generations", [])
+
+    if not generations:
+        raise RuntimeError("Stable Horde returned no generations")
+
+    img_data_or_url = generations[0].get("img", "")
+
+    if img_data_or_url.startswith("http"):
+        # Direct URL — download it
+        img_resp = session.get(img_data_or_url, timeout=60)
+        img_resp.raise_for_status()
+        img_bytes = img_resp.content
+    else:
+        # Base64-encoded
+        import base64
+        img_bytes = base64.b64decode(img_data_or_url)
+
+    if len(img_bytes) < 1000:
+        raise RuntimeError(f"Stable Horde image too small ({len(img_bytes)} bytes)")
+
+    Path(output_path).write_bytes(img_bytes)
+    logger.info(
+        "Stable Horde image saved: %s (%d bytes)", output_path, len(img_bytes),
+    )
+
+
+def _upscale_image(
+    input_path: str, output_path: str, width: int, height: int,
+) -> None:
+    """Upscale an image to target resolution using FFmpeg (scale + pad)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", (
+            f"scale={width}:{height}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}"
+        ),
+        "-q:v", "2",  # high quality JPEG
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=30)
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace")[:200]
+        raise RuntimeError(f"FFmpeg upscale failed: {stderr}")
+    logger.info("Upscaled to %dx%d: %s", width, height, output_path)
+
+
+def _safe_delete_file(path: str) -> None:
+    """Delete a file if it exists, silently ignore errors."""
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _download_with_retry(
