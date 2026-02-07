@@ -10,9 +10,11 @@ import config
 from models import JobStatus
 from services.job_manager import JobManager
 from services.transcriber import generate_word_level_srt, transcribe
+from services.image_generator import generate_scene_images, split_into_scenes
 from services.video_builder import (
     build_final_video,
     build_simple_video,
+    build_slideshow_video,
     check_ffmpeg,
     generate_waveform_video,
     get_audio_duration,
@@ -96,17 +98,49 @@ def run_pipeline(job: dict, manager: JobManager) -> None:
         # Step 4: Generate video
         # ------------------------------------------------------------------
         output_path = str(config.OUTPUTS_DIR / f"{job_id}.mp4")
+        slideshow_path = str(config.OUTPUTS_DIR / f"{job_id}_slideshow.mp4")
+        images_used = False
 
         if transcription_ok:
-            # Full pipeline: waveform video + subtitles
-            _log(manager, job_id, "🎬 Generating waveform video…")
-            waveform_path = str(config.OUTPUTS_DIR / f"{job_id}_waveform.mp4")
-            generate_waveform_video(audio_path, waveform_path, duration)
-            manager.update_status(job_id, JobStatus.PROCESSING, progress=70)
+            # --- Try AI image generation ---
+            try:
+                _log(manager, job_id, "🖼️ Splitting transcript into scenes…")
+                scenes = split_into_scenes(segments, scene_duration=5.0)
+                _log(manager, job_id, f"   {len(scenes)} scenes created.")
 
-            _log(manager, job_id, "📝 Burning subtitles into video…")
+                _log(manager, job_id, "🎨 Generating AI images (Pollinations.ai)…")
+
+                def on_img_progress(i, total):
+                    pct = 50 + int((i / total) * 20)  # 50% → 70%
+                    manager.update_status(job_id, JobStatus.PROCESSING, progress=pct)
+                    _log(manager, job_id, f"   🖼️ Image {i}/{total} ready.")
+
+                scene_images = generate_scene_images(
+                    scenes=scenes,
+                    output_dir=str(config.OUTPUTS_DIR),
+                    job_id=job_id,
+                    on_progress=on_img_progress,
+                )
+
+                _log(manager, job_id, "🎬 Building slideshow video from AI images…")
+                build_slideshow_video(scene_images, slideshow_path)
+                images_used = True
+                manager.update_status(job_id, JobStatus.PROCESSING, progress=75)
+
+            except Exception as e:
+                _log(manager, job_id, f"⚠️ AI images failed: {e}. Falling back to waveform.")
+                logger.warning("Image generation failed for %s: %s", job_id, e)
+                images_used = False
+
+            # Fallback to waveform if images failed
+            if not images_used:
+                _log(manager, job_id, "🎬 Generating waveform video (fallback)…")
+                generate_waveform_video(audio_path, slideshow_path, duration)
+                manager.update_status(job_id, JobStatus.PROCESSING, progress=75)
+
+            _log(manager, job_id, "📝 Burning subtitles + combining audio…")
             build_final_video(
-                video_path=waveform_path,
+                video_path=slideshow_path,
                 audio_path=audio_path,
                 output_path=output_path,
                 srt_path=srt_path,
@@ -116,8 +150,10 @@ def run_pipeline(job: dict, manager: JobManager) -> None:
                 job_id, JobStatus.PROCESSING, progress=90, srt_path=srt_path
             )
 
-            # Clean up intermediate waveform file
-            _safe_delete(waveform_path)
+            # Clean up intermediate files
+            _safe_delete(slideshow_path)
+            if images_used:
+                _cleanup_scene_images(job_id, str(config.OUTPUTS_DIR))
         else:
             # Fallback: simple video with static text
             _log(manager, job_id, "🎬 Generating simple video with fallback subtitles…")
@@ -166,3 +202,10 @@ def _safe_delete(path: str) -> None:
         Path(path).unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _cleanup_scene_images(job_id: str, output_dir: str) -> None:
+    """Remove temporary scene images after video is built."""
+    import glob
+    for f in glob.glob(str(Path(output_dir) / f"{job_id}_scene_*.jpg")):
+        _safe_delete(f)

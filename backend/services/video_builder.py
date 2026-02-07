@@ -55,6 +55,98 @@ def generate_background_image(output_path: str, width: int, height: int) -> str:
     return output_path
 
 
+def build_slideshow_video(
+    scene_images: list[dict],
+    output_path: str,
+    width: int = config.VIDEO_WIDTH,
+    height: int = config.VIDEO_HEIGHT,
+    fps: int = config.VIDEO_FPS,
+) -> str:
+    """
+    Build a video from AI-generated scene images with crossfade transitions.
+
+    Args:
+        scene_images: list of {"path": str, "duration": float, "start": float, "end": float}
+        output_path: path for the output video
+    """
+    if not scene_images:
+        raise RuntimeError("No scene images provided")
+
+    # Single image → simple loop
+    if len(scene_images) == 1:
+        img = scene_images[0]
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", img["path"],
+            "-t", str(img["duration"]),
+            "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=#0f0f23,format=yuv420p",
+            "-c:v", "libx264", "-preset", "fast", "-r", str(fps),
+            "-pix_fmt", "yuv420p",
+            output_path,
+        ]
+        _run_ffmpeg(cmd, "build single-image video")
+        return output_path
+
+    # Multiple images → slideshow with crossfade transitions
+    transition_dur = 0.8  # seconds of crossfade between scenes
+
+    # Build FFmpeg inputs and filter graph
+    inputs = []
+    filter_parts = []
+
+    for i, img in enumerate(scene_images):
+        inputs.extend(["-loop", "1", "-t", str(img["duration"] + transition_dur), "-i", img["path"]])
+        # Scale + pad each image to exact resolution, add setsar
+        filter_parts.append(
+            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=#0f0f23,"
+            f"setsar=1,format=yuv420p[img{i}]"
+        )
+
+    # Chain xfade transitions
+    if len(scene_images) == 2:
+        offset = max(0.1, scene_images[0]["duration"] - transition_dur)
+        filter_parts.append(
+            f"[img0][img1]xfade=transition=fade:duration={transition_dur}:offset={offset},format=yuv420p[v]"
+        )
+    else:
+        # Chain: img0 xfade img1 → tmp0, tmp0 xfade img2 → tmp1, ...
+        offset = max(0.1, scene_images[0]["duration"] - transition_dur)
+        filter_parts.append(
+            f"[img0][img1]xfade=transition=fade:duration={transition_dur}:offset={offset}[tmp0]"
+        )
+        accumulated = offset + scene_images[1]["duration"]
+        for i in range(2, len(scene_images)):
+            prev = f"tmp{i - 2}"
+            offset = max(0.1, accumulated - transition_dur)
+            if i == len(scene_images) - 1:
+                filter_parts.append(
+                    f"[{prev}][img{i}]xfade=transition=fade:duration={transition_dur}:offset={offset},format=yuv420p[v]"
+                )
+            else:
+                filter_parts.append(
+                    f"[{prev}][img{i}]xfade=transition=fade:duration={transition_dur}:offset={offset}[tmp{i - 1}]"
+                )
+            accumulated = offset + scene_images[i]["duration"]
+
+    filter_graph = ";\n".join(filter_parts)
+
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_graph,
+        "-map", "[v]",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-pix_fmt", "yuv420p",
+        "-r", str(fps),
+        output_path,
+    ]
+    _run_ffmpeg(cmd, "build slideshow video")
+    return output_path
+
+
 def generate_waveform_video(
     audio_path: str,
     output_path: str,
