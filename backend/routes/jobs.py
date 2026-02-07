@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import shutil
+import json
+import subprocess
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
@@ -44,13 +45,28 @@ async def upload_audio(request: Request, file: UploadFile = File(...)):
     if len(content) > max_size:
         raise HTTPException(400, f"File too large. Maximum size: {max_size // (1024*1024)} MB.")
 
-    # Save to disk
+    # Save to disk with a temp name, then validate duration
     manager = _manager(request)
     job_id = manager.create_job("")  # placeholder, update after save
 
     safe_filename = f"{job_id}{ext}"
     audio_path = str(config.UPLOADS_DIR / safe_filename)
     Path(audio_path).write_bytes(content)
+
+    # Validate audio duration before queueing
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", audio_path],
+            capture_output=True, text=True, timeout=15,
+        )
+        duration = float(json.loads(probe.stdout)["format"]["duration"])
+        if duration > config.MAX_AUDIO_DURATION:
+            Path(audio_path).unlink(missing_ok=True)
+            raise HTTPException(400, f"Audio too long ({duration:.0f}s). Max: {config.MAX_AUDIO_DURATION}s.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # If ffprobe fails here, let the pipeline handle it
 
     # Update job with actual audio path
     manager.update_status(
