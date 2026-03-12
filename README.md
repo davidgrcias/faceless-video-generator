@@ -2,6 +2,18 @@
 
 Generate MP4 videos from MP3 voice-overs — with real transcription and burned-in subtitles.
 
+## About This Project
+
+**Faceless Video Generator** is a full-stack AI web application that turns any voice-over audio file into a ready-to-publish faceless video — no camera, no face, no manual editing required.
+
+The core AI component is **OpenAI Whisper**, a state-of-the-art automatic speech recognition (ASR) model that runs entirely locally on your machine. It listens to the uploaded audio and produces word-level transcriptions, which are then converted into precisely-timed SRT subtitles and burned directly into the final video.
+
+On top of that, **FFmpeg** generates an audio-reactive waveform as the video background, giving the output a polished, professional look without any external assets.
+
+The result: upload an MP3, wait ~10–18 seconds, and download a 720p MP4 with animated waveform background and AI-generated captions — all offline, all free, no API keys needed.
+
+**Why "faceless"?** The growing trend of faceless content (voiceover + visuals) is popular on platforms like YouTube Shorts and TikTok because creators don't need to appear on camera. This tool automates the most tedious part of that workflow: syncing captions to speech.
+
 ## Architecture
 
 ```
